@@ -1,0 +1,33 @@
+name: Fetch wheels
+
+# Gom toàn bộ thư viện còn thiếu (kèm phụ thuộc) thành MỘT tệp wheels.zip
+# để tải về rồi gửi lại cho Claude chạy thử.
+# Đặt tệp này tại .github/workflows/fetch-wheels.yml rồi vào tab Actions > Fetch wheels > Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  wheels:
+    runs-on: ubuntu-latest   # x86_64 + Python 3.12: cùng nền tảng với môi trường chạy thử của Claude
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download wheels
+        run: |
+          python -m pip download \
+            "httpx[http2,socks]>=0.27" "fastapi>=0.110" "uvicorn>=0.29" \
+            "apscheduler>=3.10,<4" "redis>=5.0" fakeredis \
+            --only-binary=:all: --dest wheels
+          ls -1 wheels | wc -l
+
+      - name: Zip
+        run: zip -r wheels.zip wheels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheels.zip
+          compression-level: 0
