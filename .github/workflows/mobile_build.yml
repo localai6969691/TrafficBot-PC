@@ -1,0 +1,249 @@
+name: Mobile Build (tự giải nén ZIP rồi build)
+
+# Dành cho người dùng upload MỘT file .zip duy nhất lên repo (qua điện thoại,
+# không kéo-thả được cả thư mục) - workflow này tự tìm file .zip ở gốc repo,
+# giải nén, rồi chạy toàn bộ quy trình build Nuitka giống hệt build.yml.
+#
+# CÁCH DÙNG (hoàn toàn trên điện thoại, không cần terminal/máy tính):
+#   1. Tạo repo mới trên GitHub (github.com/new).
+#   2. "Add file" -> "Upload files" -> chọn file .zip của dự án -> Commit.
+#      (CHỈ upload đúng 1 file .zip, không giải nén, không kéo thư mục)
+#   3. "Add file" -> "Create new file" -> gõ đường dẫn:
+#      .github/workflows/mobile_build.yml -> dán TOÀN BỘ nội dung file này
+#      vào -> Commit.
+#   4. Tab "Actions" -> chọn "Mobile Build" -> nút "Run workflow" -> Run.
+#   5. Chờ xong (vài phút) -> mở lại run đó -> cuộn xuống mục "Artifacts"
+#      -> tải file .zip về -> gửi lại cho Claude.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_filename:
+        description: "Tên file .zip đã upload (để trống = tự tìm file .zip duy nhất ở gốc repo)"
+        required: false
+        default: ""
+      build_os:
+        description: "Build cho hệ điều hành nào"
+        required: false
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - all
+
+jobs:
+  setup:
+    name: Tính danh sách OS cần build
+    runs-on: ubuntu-latest
+    outputs:
+      os_list: ${{ steps.calc.outputs.os_list }}
+    steps:
+      - id: calc
+        shell: bash
+        run: |
+          case "${{ github.event.inputs.build_os }}" in
+            all) echo 'os_list=["ubuntu-latest","windows-latest","macos-latest"]' >> "$GITHUB_OUTPUT" ;;
+            "")  echo 'os_list=["ubuntu-latest"]' >> "$GITHUB_OUTPUT" ;;
+            *)   echo "os_list=[\"${{ github.event.inputs.build_os }}\"]" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.setup.outputs.os_list) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Bước đặc biệt của mobile_build.yml: tìm + giải nén file .zip ──────
+      - name: Tìm và giải nén file ZIP dự án
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_NAME="${{ github.event.inputs.zip_filename }}"
+          if [ -z "$ZIP_NAME" ]; then
+            # Tự tìm file .zip duy nhất ở gốc repo (bỏ qua nếu có nhiều hơn 1)
+            MATCHES=$(find . -maxdepth 1 -iname "*.zip" | wc -l)
+            if [ "$MATCHES" -eq 0 ]; then
+              echo "::error::Không tìm thấy file .zip nào ở gốc repo. Hãy upload file .zip của dự án trước."
+              exit 1
+            elif [ "$MATCHES" -gt 1 ]; then
+              echo "::error::Có nhiều hơn 1 file .zip ở gốc repo - điền rõ tên vào ô 'zip_filename' khi Run workflow."
+              find . -maxdepth 1 -iname "*.zip"
+              exit 1
+            fi
+            ZIP_NAME=$(find . -maxdepth 1 -iname "*.zip")
+          fi
+          echo "Giải nén: $ZIP_NAME"
+          mkdir -p /tmp/extracted
+          unzip -q "$ZIP_NAME" -d /tmp/extracted
+
+          # ZIP có thể chứa 1 thư mục gốc duy nhất (vd "synthetic-qa-orchestrator/")
+          # hoặc chứa thẳng các file ở top-level - xử lý cả 2 trường hợp.
+          TOPLEVEL_COUNT=$(find /tmp/extracted -mindepth 1 -maxdepth 1 | wc -l)
+          if [ "$TOPLEVEL_COUNT" -eq 1 ] && [ -d "$(find /tmp/extracted -mindepth 1 -maxdepth 1)" ]; then
+            SRC_DIR=$(find /tmp/extracted -mindepth 1 -maxdepth 1)
+            echo "Phát hiện 1 thư mục gốc trong ZIP: $SRC_DIR"
+          else
+            SRC_DIR="/tmp/extracted"
+          fi
+
+          # Dọn repo hiện tại (trừ .git và chính file .zip) rồi copy mã nguồn đã giải nén đè lên
+          find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name "$(basename "$ZIP_NAME")" -exec rm -rf {} +
+          cp -R "$SRC_DIR"/. .
+          echo "Đã giải nén xong - liệt kê gốc repo:"
+          ls -la
+
+      # Python 3.11 — Nuitka hỗ trợ tốt nhất
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Node.js — cần cho js_sandbox_probe.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Linux desktop libs (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.0-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            gir1.2-appindicator3-0.1 \
+            libgirepository1.0-dev \
+            gobject-introspection \
+            xvfb
+          pip install pystray --break-system-packages || true
+
+      - name: Download portable Chromium
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/browsers
+        run: python -m playwright install chromium
+
+      - name: Bundle Drawflow + Alpine.js from npm
+        shell: bash
+        run: |
+          mkdir -p static_assets
+          python - << 'PY'
+          import asyncio, httpx, tarfile, io
+          from pathlib import Path
+          out = Path("static_assets")
+          async def extract(pkg_url, member, out_name):
+              async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                  r = await c.get(pkg_url)
+                  with tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz") as tf:
+                      (out / out_name).write_bytes(tf.extractfile(member).read())
+                      print(f"  {out_name}: OK")
+          async def main():
+              await extract("https://registry.npmjs.org/drawflow/-/drawflow-0.0.60.tgz",
+                            "package/dist/drawflow.min.js", "drawflow.min.js")
+              await extract("https://registry.npmjs.org/drawflow/-/drawflow-0.0.60.tgz",
+                            "package/dist/drawflow.min.css", "drawflow.min.css")
+              await extract("https://registry.npmjs.org/alpinejs/-/alpinejs-3.17.5.tgz",
+                            "package/dist/cdn.min.js", "alpine.min.js")
+          asyncio.run(main())
+          PY
+
+      - name: Locate curl_cffi package path
+        id: curl_cffi_path
+        shell: bash
+        run: |
+          PATH_VAL=$(python -c "import curl_cffi, os; print(os.path.dirname(curl_cffi.__file__))")
+          echo "path=$PATH_VAL" >> "$GITHUB_OUTPUT"
+
+      - name: Compile app_launcher with Nuitka
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: app_launcher.py
+          mode: standalone
+          output-filename: StudioApp
+          include-data-dir: |
+            ${{ steps.curl_cffi_path.outputs.path }}=curl_cffi
+            static_assets=static_assets
+            ui=ui
+          include-package: ui
+
+      - name: Compile main (CLI) with Nuitka
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: main.py
+          mode: standalone
+          include-data-dir: |
+            ${{ steps.curl_cffi_path.outputs.path }}=curl_cffi
+            static_assets=static_assets
+            ui=ui
+
+      - name: Assemble portable folder
+        shell: bash
+        run: |
+          OUT="dist/SyntheticAutomationStudio"
+          mkdir -p "$OUT"
+          cp -R build/StudioApp.dist/. "$OUT/"
+          if   [ -f "$OUT/StudioApp.exe" ]; then echo "Windows desktop binary OK"
+          elif [ -f "$OUT/StudioApp.bin" ]; then mv "$OUT/StudioApp.bin" "$OUT/StudioApp"
+          elif [ -f "$OUT/StudioApp" ];     then echo "Unix desktop binary OK"; fi
+
+          if [ -d "build/main.dist" ]; then
+            if   [ -f "build/main.dist/main.exe" ]; then cp "build/main.dist/main.exe" "$OUT/runner.exe"
+            elif [ -f "build/main.dist/main" ];     then cp "build/main.dist/main"     "$OUT/runner"
+            fi
+          fi
+
+          cp -R config plugins static_assets "$OUT/"
+          cp -R ui "$OUT/"
+          mkdir -p "$OUT/profiles_data" "$OUT/data/reports" "$OUT/data/logs"
+          mkdir -p "$OUT/runtime/tunnels" "$OUT/runtime/browsers"
+          cp -R browsers "$OUT/runtime/browsers/"
+          node --version > "$OUT/runtime/node_version.txt" 2>/dev/null || echo "none" > "$OUT/runtime/node_version.txt"
+
+          cat > "$OUT/LAUNCH.txt" << 'README'
+          === Synthetic Automation Studio ===
+
+          Windows: nhấp đúp StudioApp.exe
+          macOS:   nhấp đúp StudioApp (hoặc double-click trong Finder)
+          Linux:   ./StudioApp   (hoặc: python app_launcher.py)
+
+          Headless mode (server không có GUI):
+            ./runner --dashboard        (Windows: runner.exe --dashboard)
+            python app_launcher.py --no-gui
+
+          Dashboard mặc định: http://127.0.0.1:18080
+          README
+
+      - name: Smoke test CLI
+        shell: bash
+        run: |
+          cd dist/SyntheticAutomationStudio
+          if [ -f runner.exe ]; then
+            ./runner.exe --version
+          elif [ -f runner ]; then
+            chmod +x runner && ./runner --version
+          fi
+
+      - name: Zip package
+        shell: bash
+        run: |
+          python -c "import shutil; shutil.make_archive('SyntheticAutomationStudio-${{ runner.os }}', 'zip', 'dist')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SyntheticAutomationStudio-${{ runner.os }}
+          path: SyntheticAutomationStudio-${{ runner.os }}.zip
+          compression-level: 0
